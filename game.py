@@ -16,6 +16,7 @@ class Player:
         self.is_admin: bool = False
         self.vote: Optional[int] = None  # target user_id
         self.night_choice: Optional[int] = None  # user_id комнаты
+        self.presented: bool = False
 
     def __repr__(self):
         return f"Player({self.user_id}, {self.character_name}, alive={self.is_alive})"
