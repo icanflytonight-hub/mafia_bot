@@ -6,7 +6,7 @@ from flask import Flask, request
 from aiogram import Bot, Dispatcher, types
 
 from config import BOT_TOKEN, WEBHOOK_URL
-from bot import dp, bot  # импортируем из bot.py
+from bot import dp, bot
 
 app = Flask(__name__)
 
@@ -22,8 +22,8 @@ def webhook():
 def index():
     return "Bot is running"
 
-if __name__ == "__main__":
-    # Устанавливаем вебхук при старте
-    asyncio.run(bot.set_webhook(WEBHOOK_URL))
-    port = int(os.environ.get("PORT", 5000))
-    app.run(host="0.0.0.0", port=port)
+# Устанавливаем вебхук при импорте (важно для Render)
+async def set_webhook_on_startup():
+    await bot.set_webhook(WEBHOOK_URL)
+
+asyncio.run(set_webhook_on_startup())
