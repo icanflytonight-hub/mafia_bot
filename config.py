@@ -2,7 +2,7 @@ import os
 
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "8606990913:AAGYVkPLzwzajysoLbgFAyNoNTG-T6frHgs")
 LEADER_ID = int(os.environ.get("LEADER_ID", "6398938934"))
-CHAT_ID = int(os.environ.get("CHAT_ID", "-1002290368114"))
+CHAT_ID = int(os.environ.get("CHAT_ID", "-1003936250144"))
 
 # Настройки таймеров (в секундах)
 DISCUSSION_TIME = 300        # 5 минут на обсуждение
