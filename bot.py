@@ -8,7 +8,10 @@ from datetime import datetime, timedelta
 
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.filters import Command, CommandStart
-from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton, ChatPermissions
+from aiogram.types import (
+    ReplyKeyboardMarkup, KeyboardButton, Message, CallbackQuery,
+    InlineKeyboardMarkup, InlineKeyboardButton, ChatPermissions, BotCommand
+)
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 
@@ -237,27 +240,40 @@ async def cmd_start(message: Message):
     await send_menu(message.from_user.id)
 
 async def send_menu(user_id: int):
-    keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="📜 Правила игры", callback_data="menu_rules")],
-        [InlineKeyboardButton(text="👥 Активные игроки", callback_data="menu_players")],
-        [InlineKeyboardButton(text="🚪 Покинуть игру", callback_data="menu_leave")]
-    ])
-    await bot.send_message(user_id, "Меню игры:", reply_markup=keyboard)
+    # Постоянная клавиатура (кнопки в поле ввода)
+    buttons = [
+        [KeyboardButton(text="📜 Правила игры")],
+        [KeyboardButton(text="👥 Активные игроки")],
+        [KeyboardButton(text="🚪 Покинуть игру")],
+    ]
+    # Для ведущего добавляем кнопки управления игрой
+    if user_id == LEADER_ID:
+        buttons.append([KeyboardButton(text="🎬 Установить гифку")])
+        buttons.append([KeyboardButton(text="▶️ Запустить игру")])
+        buttons.append([KeyboardButton(text="⏹ Остановить игру")])
+        buttons.append([KeyboardButton(text="🔄 Сбросить историю")])
+
+    keyboard = ReplyKeyboardMarkup(
+        keyboard=buttons,
+        resize_keyboard=True,
+        one_time_keyboard=False,
+    )
+    await bot.send_message(user_id, "Меню игры (кнопки закреплены):", reply_markup=keyboard)
 
 @router.message(Command("menu"))
 async def cmd_menu(message: Message):
     await send_menu(message.from_user.id)
 
-@router.callback_query(F.data == "menu_rules")
-async def show_rules(callback: CallbackQuery):
-    await callback.message.answer(RULES_TEXT, parse_mode="Markdown")
-    await callback.answer()
+# ---------- Обработчики кнопок постоянной клавиатуры ----------
 
-@router.callback_query(F.data == "menu_players")
-async def show_players(callback: CallbackQuery):
+@router.message(lambda message: message.text == "📜 Правила игры")
+async def button_rules(message: Message):
+    await message.answer(RULES_TEXT, parse_mode="Markdown")
+
+@router.message(lambda message: message.text == "👥 Активные игроки")
+async def button_players(message: Message):
     if not game:
-        await callback.message.answer("Сейчас нет активной игры.")
-        await callback.answer()
+        await message.answer("Сейчас нет активной игры.")
         return
     alive = [p for p in game.players.values() if p.is_alive]
     dead = [p for p in game.players.values() if not p.is_alive]
@@ -265,17 +281,47 @@ async def show_players(callback: CallbackQuery):
     text += "\n".join([f"• {p.character_name or 'Без имени'}" for p in game.players.values()])
     if dead:
         text += "\n\nВыбывшие:\n" + "\n".join([f"• {p.character_name or 'Без имени'}" for p in dead])
-    await callback.message.answer(text)
-    await callback.answer()
+    await message.answer(text)
 
-@router.callback_query(F.data == "menu_leave")
-async def leave_game(callback: CallbackQuery):
-    if game and callback.from_user.id in game.players:
-        await kick_player(callback.from_user.id)
-        await callback.message.answer("Вы покинули игру.")
+@router.message(lambda message: message.text == "🚪 Покинуть игру")
+async def button_leave(message: Message):
+    if game and message.from_user.id in game.players:
+        await kick_player(message.from_user.id)
+        await message.answer("Вы покинули игру.")
     else:
-        await callback.message.answer("Вы не участвуете в игре.")
-    await callback.answer()
+        await message.answer("Вы не участвуете в игре.")
+
+# Кнопки для ведущего
+@router.message(lambda message: message.text == "🎬 Установить гифку")
+async def button_set_gif(message: Message):
+    if message.from_user.id != LEADER_ID:
+        return
+    scenes = GIF_SCENES
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=scene, callback_data=f"set_gif_scene:{scene}")] for scene in scenes
+    ])
+    await message.answer("Выберите сцену, для которой хотите установить гифку:", reply_markup=keyboard)
+
+@router.message(lambda message: message.text == "▶️ Запустить игру")
+async def button_start_game(message: Message):
+    if message.from_user.id != LEADER_ID:
+        return
+    await message.answer("Отправьте команду /start_game в игровом чате (группе).")
+
+@router.message(lambda message: message.text == "⏹ Остановить игру")
+async def button_stop_game(message: Message):
+    if message.from_user.id != LEADER_ID:
+        return
+    await message.answer("Отправьте команду /end_game в игровом чате (группе).")
+
+@router.message(lambda message: message.text == "🔄 Сбросить историю")
+async def button_reset_history(message: Message):
+    if message.from_user.id != LEADER_ID:
+        return
+    global role_history
+    role_history = {}
+    save_json("role_history.json", role_history)
+    await message.answer("История выданных скрытых ролей сброшена.")
 
 # ---------- Присоединение к игре ----------
 
@@ -293,7 +339,7 @@ async def join_game(callback: CallbackQuery):
         await callback.answer("Вы уже участвуете.")
         return
 
-    # Проверяем, писал ли бот игроку в личку (просто отправим сообщение)
+    # Проверяем, писал ли бот игроку в личку
     try:
         await bot.send_message(user_id, "Проверка связи... Если вы видите это сообщение, всё хорошо.")
     except:
@@ -587,6 +633,22 @@ async def cmd_kick(message: Message):
 async def main():
     # Удаляем вебхук, чтобы не мешал
     await bot.delete_webhook(drop_pending_updates=True)
+
+    # Установка списка команд (появляется при вводе "/")
+    commands = [
+        BotCommand(command="start", description="Главное меню"),
+        BotCommand(command="menu", description="Показать меню"),
+        BotCommand(command="rules", description="Правила игры"),
+        BotCommand(command="players", description="Список игроков"),
+        BotCommand(command="leave", description="Покинуть игру"),
+        BotCommand(command="start_game", description="Запустить игру (ведущий)"),
+        BotCommand(command="end_game", description="Остановить игру (ведущий)"),
+        BotCommand(command="reset_history", description="Сбросить историю ролей (ведущий)"),
+        BotCommand(command="set_gif", description="Установить гифку для сцены (ведущий)"),
+        BotCommand(command="kick", description="Кикнуть игрока (ведущий)"),
+        BotCommand(command="get_chat_id", description="Узнать ID чата (ведущий)"),
+    ]
+    await bot.set_my_commands(commands)
 
     # Запускаем Flask в отдельном потоке для health check
     from flask import Flask
