@@ -664,3 +664,5 @@ async def main():
     await bot.delete_webhook(drop_pending_updates=True)
     # В webapp.py мы установим вебхук
     await dp.start_polling(bot)  # для локального запуска, но не используется при webhook
+if __name__ == "__main__":
+    asyncio.run(main())
