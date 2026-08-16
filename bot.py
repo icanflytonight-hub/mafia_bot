@@ -61,6 +61,9 @@ role_history = load_json("role_history.json", {})
 class CharacterName(StatesGroup):
     waiting = State()
 
+class Presentation(StatesGroup):
+    waiting = State()
+
 class GifScene(StatesGroup):
     waiting = State()
 
@@ -184,7 +187,6 @@ async def cmd_start_game(message: Message):
     else:
         sent_msg = await message.answer(MSG_WELCOME, reply_markup=keyboard)
 
-    # Закрепляем сообщение
     if sent_msg:
         try:
             await bot.pin_chat_message(chat_id=CHAT_ID, message_id=sent_msg.message_id)
@@ -260,7 +262,7 @@ async def cmd_get_chat_id(message: Message):
 
 @router.message(Command("force_start"))
 async def cmd_force_start(message: Message):
-    """Принудительный запуск игры, удаляя игроков без персонажа."""
+    """Принудительный запуск игры, удаляя игроков без персонажа и представления."""
     if message.from_user.id != LEADER_ID:
         await message.answer("Только для ведущего.")
         return
@@ -270,17 +272,21 @@ async def cmd_force_start(message: Message):
     await force_start_game()
 
 async def force_start_game():
-    """Удаляет игроков без персонажа и запускает ночную фазу."""
+    """Удаляет игроков без персонажа или представления и запускает ночную фазу."""
     global game
     if not game or game.phase != "registration":
         return
-    # Собираем список игроков без персонажа
-    players_without_character = [uid for uid, p in game.players.items() if not p.character_name]
-    if players_without_character:
-        for uid in players_without_character:
-            await kick_player(uid)  # кикнет из чата и из игры
-        await bot.send_message(CHAT_ID, f"Игроки без персонажа были удалены: {len(players_without_character)}")
-    # Проверяем, достаточно ли игроков для игры
+    players_to_remove = [
+        uid for uid, p in game.players.items()
+        if not p.character_name or not p.presented
+    ]
+    if players_to_remove:
+        for uid in players_to_remove:
+            await kick_player(uid)
+        await bot.send_message(
+            CHAT_ID,
+            f"Игроки без персонажа или представления удалены: {len(players_to_remove)}"
+        )
     if len(game.get_alive_players()) < 3:
         await bot.send_message(CHAT_ID, "Недостаточно игроков для начала игры (нужно минимум 3).")
         return
@@ -293,7 +299,6 @@ async def cmd_start(message: Message):
     await send_menu(message.from_user.id)
 
 async def send_menu(user_id: int):
-    # Постоянная клавиатура (кнопки в поле ввода)
     buttons = [
         [KeyboardButton(text="📜 Правила игры")],
         [KeyboardButton(text="👥 Жители")],
@@ -411,7 +416,7 @@ async def join_game(callback: CallbackQuery):
     )
     await callback.answer()
 
-# ---------- Ввод персонажа (свободный текст) ----------
+# ---------- Ввод персонажа и представление ----------
 
 @router.message(CharacterName.waiting)
 async def character_name_received(message: Message, state: FSMContext):
@@ -425,12 +430,42 @@ async def character_name_received(message: Message, state: FSMContext):
             await set_admin_title(CHAT_ID, player.user_id, name)
             await message.answer(f"Отлично! Ваш персонаж: {name}")
             await state.clear()
-            if all(p.character_name for p in game.players.values()):
-                await start_night_phase()
+            # Запрашиваем представление
+            await bot.send_message(
+                message.from_user.id,
+                "Теперь представьтесь! Напишите пару слов о себе (кто вы, что любите, чем занимаетесь). Это будет опубликовано в общем чате."
+            )
+            await state.set_state(Presentation.waiting)
         else:
             await message.answer("Пожалуйста, введите непустое название.")
     else:
         await message.answer("Вы не участвуете в игре.")
+
+@router.message(Presentation.waiting)
+async def presentation_received(message: Message, state: FSMContext):
+    if message.from_user.id == LEADER_ID:
+        return
+    if not game or message.from_user.id not in game.players:
+        await message.answer("Вы не участвуете в игре.")
+        await state.clear()
+        return
+
+    player = game.players[message.from_user.id]
+    presentation_text = message.text.strip()
+    if presentation_text:
+        # Публикуем в общий чат
+        await bot.send_message(
+            CHAT_ID,
+            f"🔹 **{player.character_name}** (@{player.username or 'нет username'}) представляется:\n{presentation_text}"
+        )
+        player.presented = True
+        await message.answer("Представление опубликовано! Ожидайте начала игры.")
+        await state.clear()
+        # Проверяем, все ли представились
+        if all(p.character_name and p.presented for p in game.players.values()):
+            await start_night_phase()
+    else:
+        await message.answer("Представление не может быть пустым. Попробуйте ещё раз.")
 
 # ---------- Ночная фаза ----------
 
@@ -515,8 +550,7 @@ async def resolve_night():
     else:
         game.klepto_stole = False
 
-    # ВАЖНО: не снимаем мут, игроки остаются замьюченными до обсуждения
-    # await unmute_all()  # убрано, чтобы мут сохранился
+    # Игроки остаются в муте до обсуждения
     await send_gif(CHAT_ID, "morning", MSG_MORNING)
 
     if game.klepto_caught:
@@ -536,7 +570,7 @@ async def start_discussion():
     game.phase = "discussion"
     await unmute_all()  # открываем чат для обсуждения
     await bot.send_message(CHAT_ID, MSG_DISCUSSION)
-    await asyncio.sleep(DISCUSSION_TIME)  # теперь 5 минут (из config.py)
+    await asyncio.sleep(DISCUSSION_TIME)  # 5 минут
     if game and game.phase == "discussion":
         await bot.send_message(CHAT_ID, MSG_VOTE_SOON)
         await asyncio.sleep(60)
@@ -597,7 +631,9 @@ async def end_voting():
 
     if chosen is not None:
         victim = game.players[chosen]
-        await bot.send_message(CHAT_ID, MSG_VOTE_RESULT.format(name=victim.character_name))
+        # Выбираем случайную фразу из VOTE_RESULTS
+        phrase = random.choice(VOTE_RESULTS)
+        await bot.send_message(CHAT_ID, phrase.format(name=victim.character_name))
         victim.is_alive = False
         winner = game.check_win_condition()
         if winner:
