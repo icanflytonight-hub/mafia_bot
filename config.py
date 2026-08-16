@@ -10,7 +10,7 @@ WEBHOOK_URL = os.environ.get(
     f"https://mafia-bot-wyx3.onrender.com/{BOT_TOKEN}"
 )
 
-DISCUSSION_TIME = 180
+DISCUSSION_TIME = 300
 VOTE_TIME = 180
 CHARACTER_TIMEOUT = 300
 NIGHT_ACTION_TIMEOUT = 180
