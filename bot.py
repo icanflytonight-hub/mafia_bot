@@ -1,9 +1,9 @@
-# bot.py
-
 import asyncio
 import logging
 import os
 import json
+import random
+import threading
 from datetime import datetime, timedelta
 
 from aiogram import Bot, Dispatcher, F, Router
@@ -68,8 +68,6 @@ async def set_admin_title(chat_id: int, user_id: int, title: str):
         await bot.promote_chat_member(
             chat_id=chat_id,
             user_id=user_id,
-            rights=None,  # в новых версиях aiogram можно передать ChatAdministratorRights с False
-            custom_title=title,
             is_anonymous=False,
             can_manage_chat=False,
             can_post_messages=False,
@@ -85,6 +83,7 @@ async def set_admin_title(chat_id: int, user_id: int, title: str):
             can_post_stories=False,
             can_edit_stories=False,
             can_delete_stories=False,
+            custom_title=title,
         )
         logger.info(f"Set admin title for {user_id}: {title}")
     except Exception as e:
@@ -157,21 +156,14 @@ async def cmd_start_game(message: Message):
     game = Game(LEADER_ID, CHAT_ID)
     game.phase = "registration"
 
-    # Отправляем сообщение с кнопкой
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="Присоединиться", callback_data="join_game")]
     ])
-    sent = await send_gif(CHAT_ID, "start_game", MSG_WELCOME)
-    # Если send_gif отправил только текст, но мы хотим заменить на сообщение с кнопкой? Нет, лучше отдельно.
-    # Проблема: send_gif отправляет сообщение с гифкой, но кнопку в caption не добавить.
-    # Поэтому для приглашения используем обычное сообщение с кнопкой, а гифку можно отправить отдельно.
-    # Решение: отправим сначала сообщение с кнопкой, а гифку как отдельное.
     if gifs.get("start_game"):
         await bot.send_animation(CHAT_ID, animation=gifs["start_game"], caption=MSG_WELCOME, reply_markup=keyboard)
     else:
         await message.answer(MSG_WELCOME, reply_markup=keyboard)
 
-    game.registration_message_id = sent.message_id if sent else None
     logger.info("Game started, registration phase")
 
 @router.message(Command("end_game"))
@@ -199,7 +191,6 @@ async def cmd_set_gif(message: Message, state: FSMContext):
     if message.from_user.id != LEADER_ID:
         await message.answer("Только для ведущего.")
         return
-    # Предлагаем выбрать сцену
     scenes = GIF_SCENES
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text=scene, callback_data=f"set_gif_scene:{scene}")] for scene in scenes
@@ -310,11 +301,8 @@ async def join_game(callback: CallbackQuery):
         return
 
     game.add_player(user_id, callback.from_user.username, callback.from_user.first_name)
-    # Выдаём временную админку с заглушкой "Выбирает персонажа..."
     await set_admin_title(CHAT_ID, user_id, "Выбирает персонажа...")
-    # Отправляем запрос на ввод персонажа
     await bot.send_message(user_id, MSG_ASK_CHARACTER)
-    # Обновляем сообщение в группе (можно отредактировать или отправить новое)
     await callback.message.edit_text(
         f"Присоединился: {callback.from_user.full_name}\nВсего игроков: {len(game.players)}",
         reply_markup=callback.message.reply_markup
@@ -350,10 +338,7 @@ async def start_night_phase():
     if not game:
         return
     game.phase = "night"
-    # 1. Объявляем расселение (уже было? нет, это перед ночью)
-    # Уже отправлено "Все жители расселились..." при старте? В требованиях это сообщение идёт после выбора персонажей, перед отбоем.
-    await send_gif(CHAT_ID, "start_game", MSG_ALL_SETTLED)  # используем scene "start_game" для расселения? Лучше отдельный.
-    # Назначаем скрытые роли
+    await send_gif(CHAT_ID, "start_game", MSG_ALL_SETTLED)
     try:
         game.assign_hidden_roles(role_history)
         save_json("role_history.json", role_history)
@@ -369,27 +354,20 @@ async def start_night_phase():
             "uborshica": "Вы — **Уборщица**! Ваша цель — помешать клептоману. Ночью выберите комнату для мытья. Если клептоман выберет ту же комнату, кража не состоится."
         }[role]
         await bot.send_message(user_id, role_text)
-        # Отправляем клавиатуру выбора комнаты
         alive_players = game.get_alive_players()
-        # Исключаем самого себя, если роль не клептоман? В правилах клептоман не может выбрать свою комнату, так как он живёт в комнате, но не сказано явно. Для всех ролей исключаем собственную комнату.
         targets = [p for p in alive_players if p.user_id != user_id]
         keyboard = InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text=f"{p.character_name}", callback_data=f"night_choice:{p.user_id}")] for p in targets
         ])
         await bot.send_message(user_id, "Выберите комнату (игрока):", reply_markup=keyboard)
 
-    # Мьютим чат
     await mute_all_except_leader()
-    # Отправляем ночное сообщение с гифкой
     await send_gif(CHAT_ID, "night", MSG_NIGHT_START)
-    # Устанавливаем таймер на ночные действия (если не все ответят, принудительно завершим)
-    # Реализуем через asyncio.create_task
     asyncio.create_task(night_timeout())
 
 async def night_timeout():
     await asyncio.sleep(NIGHT_ACTION_TIMEOUT)
     if game and game.phase == "night":
-        # Если не все скрытые роли выбрали, делаем случайный выбор
         for role, user_id in game.hidden_roles.items():
             if user_id not in game.night_actions:
                 alive = game.get_alive_players()
@@ -400,7 +378,6 @@ async def night_timeout():
                     await bot.send_message(user_id, f"Вы не выбрали комнату. Выбрана случайно: {game.players[random_target].character_name}")
         await resolve_night()
 
-# Обработка выбора комнаты ночью
 @router.callback_query(F.data.startswith("night_choice:"))
 async def night_choice(callback: CallbackQuery):
     if not game or game.phase != "night":
@@ -415,7 +392,6 @@ async def night_choice(callback: CallbackQuery):
     game.night_actions[role] = target_id
     await callback.message.edit_text(f"Вы выбрали: {game.players[target_id].character_name}")
     await callback.answer()
-    # Если все три роли выбрали, завершаем ночь
     if len(game.night_actions) == 3:
         await resolve_night()
 
@@ -424,36 +400,24 @@ async def resolve_night():
     if not game or game.phase != "night":
         return
     game.phase = "morning"
-    # Получаем действия
     klepto_target = game.night_actions.get("klepto")
     komendant_target = game.night_actions.get("komendant")
     uborshica_target = game.night_actions.get("uborshica")
 
-    # Проверяем поимку комендантом
     game.klepto_caught = (klepto_target is not None and klepto_target == komendant_target)
 
-    # Проверяем уборку
     if not game.klepto_caught and klepto_target is not None:
         if klepto_target == uborshica_target:
-            game.klepto_stole = False  # не смог украсть
+            game.klepto_stole = False
         else:
             game.klepto_stole = True
             game.klepto_stole_from = klepto_target
     else:
         game.klepto_stole = False
 
-    # Снимаем мут
     await unmute_all()
-
-    # Отправляем утреннее сообщение
     await send_gif(CHAT_ID, "morning", MSG_MORNING)
 
-    # Сообщения о действиях скрытых ролей (по желанию можно разбить)
-    if game.klepto_target:
-        # можно отправить сначала "Клептоман уже выбрал комнату..." и т.д., но уже поздно, они были в предыдущих сообщениях.
-        pass
-
-    # Объявляем результаты ночи
     if game.klepto_caught:
         await bot.send_message(CHAT_ID, "🚨 Комендант поймал клептомана в комнате! Игра окончена.")
         game.winner = "residents"
@@ -465,13 +429,11 @@ async def resolve_night():
     else:
         await bot.send_message(CHAT_ID, "Сегодня ночью клептоман остался ни с чем (или не смог украсть).")
 
-    # Переходим к обсуждению
     await start_discussion()
 
 async def start_discussion():
     game.phase = "discussion"
     await bot.send_message(CHAT_ID, MSG_DISCUSSION)
-    # Запускаем таймер обсуждения
     await asyncio.sleep(DISCUSSION_TIME)
     if game and game.phase == "discussion":
         await bot.send_message(CHAT_ID, MSG_VOTE_SOON)
@@ -483,18 +445,15 @@ async def start_voting():
     game.phase = "voting"
     game.vote_results = {}
     game.vote_count = {}
-    # СТОП ЧАТ
     await mute_all_except_leader()
     await bot.send_message(CHAT_ID, "СТОП ЧАТ")
     await bot.send_message(CHAT_ID, MSG_VOTE_NOW)
-    # Рассылаем голосование всем игрокам
     alive = game.get_alive_players()
     for player in game.players.values():
         keyboard = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text=f"{p.character_name}", callback_data=f"vote:{p.user_id}")] for p in alive if p.user_id != player.user_id  # можно голосовать за себя? Обычно нет. Исключаем себя.
+            [InlineKeyboardButton(text=f"{p.character_name}", callback_data=f"vote:{p.user_id}")] for p in alive if p.user_id != player.user_id
         ])
         await bot.send_message(player.user_id, "Голосуйте за подозреваемого:", reply_markup=keyboard)
-    # Запускаем таймер голосования
     asyncio.create_task(vote_timeout())
 
 async def vote_timeout():
@@ -515,7 +474,6 @@ async def vote_callback(callback: CallbackQuery):
     game.vote_results[voter_id] = target_id
     await callback.message.edit_text("Ваш голос учтён.")
     await callback.answer()
-    # Если все проголосовали
     if len(game.vote_results) == len(game.players):
         await end_voting()
 
@@ -523,37 +481,27 @@ async def end_voting():
     if not game or game.phase != "voting":
         return
     game.phase = "results"
-    # Считаем голоса
     vote_count = {}
     for target_id in game.vote_results.values():
         vote_count[target_id] = vote_count.get(target_id, 0) + 1
-    # Находим игрока с максимальным числом голосов
     if vote_count:
         max_votes = max(vote_count.values())
         top = [uid for uid, count in vote_count.items() if count == max_votes]
-        if len(top) > 1:
-            # Ничья, можно выбрать случайного или пропустить. По правилам не указано. Сделаем переголосование? Просто выберем случайного.
-            chosen = random.choice(top)
-        else:
-            chosen = top[0]
+        chosen = random.choice(top) if len(top) > 1 else top[0]
     else:
         chosen = None
 
-    # Снимаем мут
     await unmute_all()
 
     if chosen is not None:
         victim = game.players[chosen]
         await bot.send_message(CHAT_ID, MSG_VOTE_RESULT.format(name=victim.character_name))
-        # Поднимаем матрас
         victim.is_alive = False
-        # Проверяем победу
         winner = game.check_win_condition()
         if winner:
             game.winner = winner
             await finish_game()
             return
-        # Если клептоман не пойман, продолжаем: новая ночь
         await start_night_phase()
     else:
         await bot.send_message(CHAT_ID, "Никто не проголосовал. Пропускаем день.")
@@ -563,18 +511,14 @@ async def finish_game():
     global game
     if not game:
         return
-    # Снимаем все временные админки
     for user_id in game.players:
         await remove_admin(CHAT_ID, user_id)
-    # Снимаем мут (если был)
     await unmute_all()
-    # Формируем итоговое сообщение
     if game.winner == "klepto":
         pobediteli = MSG_KLEPTO_WIN
     else:
         pobediteli = MSG_RESIDENTS_WIN
 
-    # Информация о скрытых ролях
     roles_info = []
     for role, uid in game.hidden_roles.items():
         player = game.players.get(uid)
@@ -597,55 +541,36 @@ async def finish_game():
     )
     await send_gif(CHAT_ID, "game_end", final_text)
     game.phase = "ended"
-    # Очищаем game? Можно оставить, но разрешить новую игру.
     logger.info("Game finished")
 
-# ---------- Кик игрока ----------
-
 async def kick_player(user_id: int):
-    """Удаляет игрока из игры и из группы."""
     if not game or user_id not in game.players:
         return
-    # Если игрок - скрытая роль, сообщим
-    if game.get_hidden_role_info(user_id):
-        # Можно пересоздать или просто отметить, что роль выбыла
-        pass
-    # Снимаем админку
     await remove_admin(CHAT_ID, user_id)
-    # Удаляем из игры
     game.remove_player(user_id)
-    # Баним и сразу разбаниваем, чтобы удалить из чата
     try:
         await bot.ban_chat_member(chat_id=CHAT_ID, user_id=user_id, revoke_messages=False)
         await bot.unban_chat_member(chat_id=CHAT_ID, user_id=user_id)
     except Exception as e:
         logger.error(f"Failed to kick {user_id}: {e}")
-    # Если игрок был скрытой ролью и игра продолжается, можно назначить замену или пометить
-    # Для простоты: если роль была, оставить пустой и уведомить ведущего.
     for role, uid in list(game.hidden_roles.items()):
         if uid == user_id:
             del game.hidden_roles[role]
-            await bot.send_message(CHAT_ID, f"Внимание! {game.players[user_id].character_name} покинул игру, освободилась скрытая роль {role}.")
-            # Можно пересоздать роль среди оставшихся, но это сложно. Пока просто пропустим.
-
-    # Если игрок был единственным живым, возможно, нужно проверить победу
+            await bot.send_message(CHAT_ID, f"Внимание! Игрок покинул игру, освободилась скрытая роль {role}.")
     winner = game.check_win_condition()
     if winner and game.phase != "ended":
         game.winner = winner
         await finish_game()
 
-# ---------- Команда для кика вручную (опционально) ----------
 @router.message(Command("kick"))
 async def cmd_kick(message: Message):
     if message.from_user.id != LEADER_ID:
         return
-    # Формат: /kick @username
     args = message.text.split()
     if len(args) != 2:
         await message.answer("Использование: /kick @username")
         return
     username = args[1].lstrip('@')
-    # Найти игрока по username
     target_id = None
     for uid, p in game.players.items():
         if p.username and p.username.lower() == username.lower():
@@ -657,12 +582,28 @@ async def cmd_kick(message: Message):
     else:
         await message.answer("Игрок не найден.")
 
-# ---------- Запуск бота ----------
+# ---------- Запуск бота (polling + Flask health check) ----------
 
 async def main():
-    # Устанавливаем вебхук (если используется webapp.py, то там)
+    # Удаляем вебхук, чтобы не мешал
     await bot.delete_webhook(drop_pending_updates=True)
-    # В webapp.py мы установим вебхук
-    await dp.start_polling(bot)  # для локального запуска, но не используется при webhook
+
+    # Запускаем Flask в отдельном потоке для health check
+    from flask import Flask
+    app = Flask(__name__)
+
+    @app.route('/')
+    def health():
+        return "OK"
+
+    port = int(os.environ.get('PORT', 10000))
+    threading.Thread(
+        target=lambda: app.run(host='0.0.0.0', port=port, debug=False),
+        daemon=True
+    ).start()
+
+    # Запускаем поллинг
+    await dp.start_polling(bot)
+
 if __name__ == "__main__":
     asyncio.run(main())
