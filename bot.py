@@ -158,16 +158,9 @@ async def delete_messages_in_restricted_phases(message: Message):
 
 @router.message(Command("start_game"))
 async def cmd_start_game(message: Message):
-    global game
-    if message.from_user.id != LEADER_ID:
-        await message.answer("Эта команда доступна только ведущему.")
-        return
-    if message.chat.id != CHAT_ID:
-        await message.answer("Команду /start_game нужно отправлять в игровом чате.")
-        return
-    if game and game.phase != "ended":
-        await message.answer("Игра уже идёт. Завершите её командой /end_game.")
-        return
+    # Диагностика: просто отвечаем в чат с информацией
+    await message.answer(f"Получена команда start_game.\nChat ID: {message.chat.id}\nUser ID: {message.from_user.id}")
+    return
 
     game = Game(LEADER_ID, CHAT_ID)
     game.phase = "registration"
