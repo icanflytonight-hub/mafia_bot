@@ -141,6 +141,16 @@ async def send_gif(chat_id: int, scene: str, caption: str = ""):
     else:
         await bot.send_message(chat_id, caption)
 
+# ---------- Middleware: удаление сообщений в ночь и голосование ----------
+@router.message(F.chat.type.in_({"group", "supergroup"}))
+async def delete_messages_in_restricted_phases(message: Message):
+    if game and game.phase in ["night", "voting"] and message.from_user.id != LEADER_ID:
+        try:
+            await message.delete()
+            logger.info(f"Deleted message from {message.from_user.id} during {game.phase}")
+        except Exception as e:
+            logger.error(f"Failed to delete message: {e}")
+
 # ---------- Обработчики команд (только для ведущего) ----------
 
 @router.message(Command("start_game"))
@@ -162,10 +172,25 @@ async def cmd_start_game(message: Message):
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="Присоединиться", callback_data="join_game")]
     ])
+
+    sent_msg = None
     if gifs.get("start_game"):
-        await bot.send_animation(CHAT_ID, animation=gifs["start_game"], caption=MSG_WELCOME, reply_markup=keyboard)
+        sent_msg = await bot.send_animation(
+            CHAT_ID,
+            animation=gifs["start_game"],
+            caption=MSG_WELCOME,
+            reply_markup=keyboard
+        )
     else:
-        await message.answer(MSG_WELCOME, reply_markup=keyboard)
+        sent_msg = await message.answer(MSG_WELCOME, reply_markup=keyboard)
+
+    # Закрепляем сообщение
+    if sent_msg:
+        try:
+            await bot.pin_chat_message(chat_id=CHAT_ID, message_id=sent_msg.message_id)
+            logger.info("Сообщение о старте игры закреплено.")
+        except Exception as e:
+            logger.error(f"Не удалось закрепить сообщение: {e}")
 
     logger.info("Game started, registration phase")
 
@@ -233,6 +258,34 @@ async def cmd_get_chat_id(message: Message):
     if message.from_user.id == LEADER_ID:
         await message.answer(f"ID этого чата: {message.chat.id}")
 
+@router.message(Command("force_start"))
+async def cmd_force_start(message: Message):
+    """Принудительный запуск игры, удаляя игроков без персонажа."""
+    if message.from_user.id != LEADER_ID:
+        await message.answer("Только для ведущего.")
+        return
+    if not game or game.phase != "registration":
+        await message.answer("Сейчас нельзя принудительно запустить игру.")
+        return
+    await force_start_game()
+
+async def force_start_game():
+    """Удаляет игроков без персонажа и запускает ночную фазу."""
+    global game
+    if not game or game.phase != "registration":
+        return
+    # Собираем список игроков без персонажа
+    players_without_character = [uid for uid, p in game.players.items() if not p.character_name]
+    if players_without_character:
+        for uid in players_without_character:
+            await kick_player(uid)  # кикнет из чата и из игры
+        await bot.send_message(CHAT_ID, f"Игроки без персонажа были удалены: {len(players_without_character)}")
+    # Проверяем, достаточно ли игроков для игры
+    if len(game.get_alive_players()) < 3:
+        await bot.send_message(CHAT_ID, "Недостаточно игроков для начала игры (нужно минимум 3).")
+        return
+    await start_night_phase()
+
 # ---------- Обработчики для игроков ----------
 
 @router.message(CommandStart())
@@ -243,10 +296,9 @@ async def send_menu(user_id: int):
     # Постоянная клавиатура (кнопки в поле ввода)
     buttons = [
         [KeyboardButton(text="📜 Правила игры")],
-        [KeyboardButton(text="👥 Активные игроки")],
+        [KeyboardButton(text="👥 Жители")],
         [KeyboardButton(text="🚪 Покинуть игру")],
     ]
-    # Для ведущего добавляем кнопки управления игрой
     if user_id == LEADER_ID:
         buttons.append([KeyboardButton(text="🎬 Установить гифку")])
         buttons.append([KeyboardButton(text="▶️ Запустить игру")])
@@ -270,14 +322,14 @@ async def cmd_menu(message: Message):
 async def button_rules(message: Message):
     await message.answer(RULES_TEXT, parse_mode="Markdown")
 
-@router.message(lambda message: message.text == "👥 Активные игроки")
+@router.message(lambda message: message.text == "👥 Жители")
 async def button_players(message: Message):
     if not game:
         await message.answer("Сейчас нет активной игры.")
         return
     alive = [p for p in game.players.values() if p.is_alive]
     dead = [p for p in game.players.values() if not p.is_alive]
-    text = "**Участники:**\n"
+    text = "**Жители:**\n"
     text += "\n".join([f"• {p.character_name or 'Без имени'}" for p in game.players.values()])
     if dead:
         text += "\n\nВыбывшие:\n" + "\n".join([f"• {p.character_name or 'Без имени'}" for p in dead])
@@ -306,13 +358,18 @@ async def button_set_gif(message: Message):
 async def button_start_game(message: Message):
     if message.from_user.id != LEADER_ID:
         return
-    await message.answer("Отправьте команду /start_game в игровом чате (группе).")
+    if game and game.phase == "registration":
+        await force_start_game()
+    else:
+        await message.answer("Сейчас нельзя запустить игру. Возможно, игра уже идёт или не создана.")
 
 @router.message(lambda message: message.text == "⏹ Остановить игру")
 async def button_stop_game(message: Message):
     if message.from_user.id != LEADER_ID:
         return
-    await message.answer("Отправьте команду /end_game в игровом чате (группе).")
+    if game and game.phase != "ended":
+        await finish_game()
+    await message.answer("Игра остановлена.")
 
 @router.message(lambda message: message.text == "🔄 Сбросить историю")
 async def button_reset_history(message: Message):
@@ -339,7 +396,6 @@ async def join_game(callback: CallbackQuery):
         await callback.answer("Вы уже участвуете.")
         return
 
-    # Проверяем, писал ли бот игроку в личку
     try:
         await bot.send_message(user_id, "Проверка связи... Если вы видите это сообщение, всё хорошо.")
     except:
@@ -350,7 +406,7 @@ async def join_game(callback: CallbackQuery):
     await set_admin_title(CHAT_ID, user_id, "Выбирает персонажа...")
     await bot.send_message(user_id, MSG_ASK_CHARACTER)
     await callback.message.edit_text(
-        f"Присоединился: {callback.from_user.full_name}\nВсего игроков: {len(game.players)}",
+        f"Присоединился: {callback.from_user.full_name}\nВсего жителей: {len(game.players)}",
         reply_markup=callback.message.reply_markup
     )
     await callback.answer()
@@ -369,7 +425,6 @@ async def character_name_received(message: Message, state: FSMContext):
             await set_admin_title(CHAT_ID, player.user_id, name)
             await message.answer(f"Отлично! Ваш персонаж: {name}")
             await state.clear()
-            # Проверяем, все ли выбрали персонажа
             if all(p.character_name for p in game.players.values()):
                 await start_night_phase()
         else:
@@ -392,7 +447,6 @@ async def start_night_phase():
         await bot.send_message(CHAT_ID, f"Ошибка: {e}")
         await finish_game()
         return
-    # Отправляем роли в личку
     for role, user_id in game.hidden_roles.items():
         role_text = {
             "klepto": "Вы — **Клептоман**! Ваша цель — выжить до конца, пока не останется два игрока. Ночью выберите комнату (живого игрока) для кражи.",
@@ -461,7 +515,8 @@ async def resolve_night():
     else:
         game.klepto_stole = False
 
-    await unmute_all()
+    # ВАЖНО: не снимаем мут, игроки остаются замьюченными до обсуждения
+    # await unmute_all()  # убрано, чтобы мут сохранился
     await send_gif(CHAT_ID, "morning", MSG_MORNING)
 
     if game.klepto_caught:
@@ -479,8 +534,9 @@ async def resolve_night():
 
 async def start_discussion():
     game.phase = "discussion"
+    await unmute_all()  # открываем чат для обсуждения
     await bot.send_message(CHAT_ID, MSG_DISCUSSION)
-    await asyncio.sleep(DISCUSSION_TIME)
+    await asyncio.sleep(DISCUSSION_TIME)  # теперь 5 минут (из config.py)
     if game and game.phase == "discussion":
         await bot.send_message(CHAT_ID, MSG_VOTE_SOON)
         await asyncio.sleep(60)
@@ -631,17 +687,16 @@ async def cmd_kick(message: Message):
 # ---------- Запуск бота (polling + Flask health check) ----------
 
 async def main():
-    # Удаляем вебхук, чтобы не мешал
     await bot.delete_webhook(drop_pending_updates=True)
 
-    # Установка списка команд (появляется при вводе "/")
     commands = [
         BotCommand(command="start", description="Главное меню"),
         BotCommand(command="menu", description="Показать меню"),
         BotCommand(command="rules", description="Правила игры"),
-        BotCommand(command="players", description="Список игроков"),
+        BotCommand(command="players", description="Список жителей"),
         BotCommand(command="leave", description="Покинуть игру"),
         BotCommand(command="start_game", description="Запустить игру (ведущий)"),
+        BotCommand(command="force_start", description="Принудительно начать игру (ведущий)"),
         BotCommand(command="end_game", description="Остановить игру (ведущий)"),
         BotCommand(command="reset_history", description="Сбросить историю ролей (ведущий)"),
         BotCommand(command="set_gif", description="Установить гифку для сцены (ведущий)"),
@@ -650,7 +705,6 @@ async def main():
     ]
     await bot.set_my_commands(commands)
 
-    # Запускаем Flask в отдельном потоке для health check
     from flask import Flask
     app = Flask(__name__)
 
@@ -664,7 +718,6 @@ async def main():
         daemon=True
     ).start()
 
-    # Запускаем поллинг
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
