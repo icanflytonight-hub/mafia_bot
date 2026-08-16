@@ -683,7 +683,7 @@ async def end_voting():
             # Формируем список украденных вещей
             if game.stolen_items:
                 items_list = ", ".join([item for _, item in game.stolen_items])
-                await bot.send_message(CHAT_ID, f"Под матрасом клептомана оказались: {items_list}!")
+                await bot.send_message(CHAT_ID, f"Под матрасом клептомана нашли: {items_list}!")
             else:
                 await bot.send_message(CHAT_ID, "Под матрасом клептомана ничего не оказалось.")
             game.winner = "residents"
