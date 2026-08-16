@@ -10,7 +10,6 @@ from bot import dp, bot
 
 app = Flask(__name__)
 
-# Создаём постоянный event loop и запускаем его в фоновом потоке
 loop = asyncio.new_event_loop()
 
 def run_loop(loop):
@@ -22,14 +21,22 @@ threading.Thread(target=run_loop, args=(loop,), daemon=True).start()
 @app.route(f"/{BOT_TOKEN}", methods=["POST"])
 def webhook():
     if request.method == "POST":
-        try:
-            update = types.Update.model_validate(request.get_json(), context={"bot": bot})
-            future = asyncio.run_coroutine_threadsafe(dp.feed_update(bot, update), loop)
-            future.result(timeout=30)
-            return "ok"
-        except Exception:
-            logging.error("Error processing update:\n" + traceback.format_exc())
-            return "error", 500
+        data = request.get_json()
+        # Проверяем, есть ли сообщение
+        if "message" in data and "chat" in data["message"]:
+            chat_id = data["message"]["chat"]["id"]
+            future = asyncio.run_coroutine_threadsafe(
+                bot.send_message(chat_id, "Тестовое сообщение от вебхука!"),
+                loop
+            )
+            try:
+                future.result(timeout=30)
+                return "ok"
+            except Exception as e:
+                logging.error(f"Error sending test message: {e}\n{traceback.format_exc()}")
+                return "error", 500
+        else:
+            return "ok"  # игнорируем другие типы обновлений
     return "Method not allowed", 405
 
 @app.route("/")
