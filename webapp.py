@@ -1,6 +1,7 @@
 import asyncio
 import threading
 import logging
+import traceback
 from flask import Flask, request
 from aiogram import types
 
@@ -21,13 +22,13 @@ threading.Thread(target=run_loop, args=(loop,), daemon=True).start()
 @app.route(f"/{BOT_TOKEN}", methods=["POST"])
 def webhook():
     if request.method == "POST":
-        update = types.Update.model_validate(request.get_json(), context={"bot": bot})
-        future = asyncio.run_coroutine_threadsafe(dp.feed_update(bot, update), loop)
         try:
+            update = types.Update.model_validate(request.get_json(), context={"bot": bot})
+            future = asyncio.run_coroutine_threadsafe(dp.feed_update(bot, update), loop)
             future.result(timeout=30)
             return "ok"
-        except Exception as e:
-            logging.error(f"Error processing update: {e}")
+        except Exception:
+            logging.error("Error processing update:\n" + traceback.format_exc())
             return "error", 500
     return "Method not allowed", 405
 
