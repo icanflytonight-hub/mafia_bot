@@ -430,7 +430,6 @@ async def character_name_received(message: Message, state: FSMContext):
             await set_admin_title(CHAT_ID, player.user_id, name)
             await message.answer(f"Отлично! Ваш персонаж: {name}")
             await state.clear()
-            # Запрашиваем представление
             await bot.send_message(
                 message.from_user.id,
                 "Теперь представьтесь! Напишите пару слов о себе (кто вы, что любите, чем занимаетесь). Это будет опубликовано в общем чате."
@@ -453,7 +452,6 @@ async def presentation_received(message: Message, state: FSMContext):
     player = game.players[message.from_user.id]
     presentation_text = message.text.strip()
     if presentation_text:
-        # Публикуем в общий чат
         await bot.send_message(
             CHAT_ID,
             f"🔹 **{player.character_name}** (@{player.username or 'нет username'}) представляется:\n{presentation_text}"
@@ -461,7 +459,6 @@ async def presentation_received(message: Message, state: FSMContext):
         player.presented = True
         await message.answer("Представление опубликовано! Ожидайте начала игры.")
         await state.clear()
-        # Проверяем, все ли представились
         if all(p.character_name and p.presented for p in game.players.values()):
             await start_night_phase()
     else:
@@ -474,6 +471,12 @@ async def start_night_phase():
     if not game:
         return
     game.phase = "night"
+    game.night_actions = {}
+    game.klepto_item = None
+    game.klepto_caught = False
+    game.klepto_stole = False
+    game.klepto_stole_from = None
+
     await send_gif(CHAT_ID, "start_game", MSG_ALL_SETTLED)
     try:
         game.assign_hidden_roles(role_history)
@@ -482,9 +485,10 @@ async def start_night_phase():
         await bot.send_message(CHAT_ID, f"Ошибка: {e}")
         await finish_game()
         return
+
     for role, user_id in game.hidden_roles.items():
         role_text = {
-            "klepto": "Вы — **Клептоман**! Ваша цель — выжить до конца, пока не останется два игрока. Ночью выберите комнату (живого игрока) для кражи.",
+            "klepto": "Вы — **Клептоман**! Ваша цель — выжить до конца, пока не останется два игрока. Ночью выберите комнату (живого игрока) для кражи, а затем укажите, что именно вы крадёте.",
             "komendant": "Вы — **Комендант**! Ваша цель — найти клептомана. Ночью выберите комнату для проверки. Если выберете ту же, что и клептоман, он будет пойман.",
             "uborshica": "Вы — **Уборщица**! Ваша цель — помешать клептоману. Ночью выберите комнату для мытья. Если клептоман выберет ту же комнату, кража не состоится."
         }[role]
@@ -504,13 +508,17 @@ async def night_timeout():
     await asyncio.sleep(NIGHT_ACTION_TIMEOUT)
     if game and game.phase == "night":
         for role, user_id in game.hidden_roles.items():
-            if user_id not in game.night_actions:
+            if role not in game.night_actions:
                 alive = game.get_alive_players()
                 targets = [p for p in alive if p.user_id != user_id]
                 if targets:
                     random_target = random.choice(targets).user_id
                     game.night_actions[role] = random_target
                     await bot.send_message(user_id, f"Вы не выбрали комнату. Выбрана случайно: {game.players[random_target].character_name}")
+        klepto_id = game.hidden_roles.get("klepto")
+        if klepto_id and "klepto" in game.night_actions and game.klepto_item is None:
+            game.klepto_item = "что-то загадочное (не указал)"
+            await bot.send_message(klepto_id, "Вы не указали вещь. Будем считать, что украли что-то загадочное.")
         await resolve_night()
 
 @router.callback_query(F.data.startswith("night_choice:"))
@@ -527,8 +535,39 @@ async def night_choice(callback: CallbackQuery):
     game.night_actions[role] = target_id
     await callback.message.edit_text(f"Вы выбрали: {game.players[target_id].character_name}")
     await callback.answer()
+
     if len(game.night_actions) == 3:
+        klepto_id = game.hidden_roles.get("klepto")
+        komendant_target = game.night_actions.get("komendant")
+        klepto_target = game.night_actions.get("klepto")
+
+        if klepto_target is not None and klepto_target == komendant_target:
+            await resolve_night()
+            return
+
+        if klepto_id and game.klepto_item is None:
+            victim_name = game.players[klepto_target].character_name
+            await bot.send_message(
+                klepto_id,
+                f"Вы выбрали комнату **{victim_name}**. Какую вещь вы крадёте? (напишите текстом)"
+            )
+            game.klepto_awaiting_item = True
+            return
+
         await resolve_night()
+
+@router.message(lambda message: game and game.klepto_awaiting_item and message.from_user.id == game.hidden_roles.get("klepto"))
+async def klepto_item_received(message: Message):
+    if not game or game.phase != "night":
+        return
+    item = message.text.strip()
+    if item:
+        game.klepto_item = item
+        game.klepto_awaiting_item = False
+        await message.answer(f"Вы украли: {item}")
+        await resolve_night()
+    else:
+        await message.answer("Вещь не может быть пустой. Напишите, что крадёте.")
 
 async def resolve_night():
     global game
@@ -547,20 +586,23 @@ async def resolve_night():
         else:
             game.klepto_stole = True
             game.klepto_stole_from = klepto_target
+            if game.klepto_item:
+                victim_name = game.players[klepto_target].character_name
+                game.stolen_items.append((victim_name, game.klepto_item))
     else:
         game.klepto_stole = False
 
-    # Игроки остаются в муте до обсуждения
     await send_gif(CHAT_ID, "morning", MSG_MORNING)
 
     if game.klepto_caught:
         await bot.send_message(CHAT_ID, "🚨 Комендант поймал клептомана в комнате! Игра окончена.")
         game.winner = "residents"
+        game.end_reason = "caught"
         await finish_game()
         return
     elif game.klepto_stole:
         victim_name = game.players[game.klepto_stole_from].character_name
-        await bot.send_message(CHAT_ID, f"Сегодня ночью клептоман посетил {victim_name} и украл его вещь.")
+        await bot.send_message(CHAT_ID, f"Сегодня ночью клептоман посетил {victim_name} и украл: {game.klepto_item}")
     else:
         await bot.send_message(CHAT_ID, "Сегодня ночью клептоман остался ни с чем (или не смог украсть).")
 
@@ -568,9 +610,9 @@ async def resolve_night():
 
 async def start_discussion():
     game.phase = "discussion"
-    await unmute_all()  # открываем чат для обсуждения
+    await unmute_all()
     await bot.send_message(CHAT_ID, MSG_DISCUSSION)
-    await asyncio.sleep(DISCUSSION_TIME)  # 5 минут
+    await asyncio.sleep(DISCUSSION_TIME)
     if game and game.phase == "discussion":
         await bot.send_message(CHAT_ID, MSG_VOTE_SOON)
         await asyncio.sleep(60)
@@ -631,13 +673,28 @@ async def end_voting():
 
     if chosen is not None:
         victim = game.players[chosen]
-        # Выбираем случайную фразу из VOTE_RESULTS
         phrase = random.choice(VOTE_RESULTS)
         await bot.send_message(CHAT_ID, phrase.format(name=victim.character_name))
         victim.is_alive = False
+
+        # Проверяем, является ли выбранный клептоманом
+        klepto_id = game.hidden_roles.get("klepto")
+        if chosen == klepto_id:
+            # Формируем список украденных вещей
+            if game.stolen_items:
+                items_list = ", ".join([item for _, item in game.stolen_items])
+                await bot.send_message(CHAT_ID, f"Под матрасом клептомана оказались: {items_list}!")
+            else:
+                await bot.send_message(CHAT_ID, "Под матрасом клептомана ничего не оказалось.")
+            game.winner = "residents"
+            game.end_reason = "vote"
+            await finish_game()
+            return
+
         winner = game.check_win_condition()
         if winner:
             game.winner = winner
+            game.end_reason = "win" if winner == "klepto" else "vote"
             await finish_game()
             return
         await start_night_phase()
@@ -672,11 +729,17 @@ async def finish_game():
     others = [p.character_name for p in game.players.values() if p.hidden_role is None]
     others_text = "\n".join(others) if others else "Нет."
 
+    stolen_block = ""
+    if game.end_reason != "vote" and game.stolen_items:
+        stolen_lines = "\n".join([f"• {item} (у {victim})" for victim, item in game.stolen_items])
+        stolen_block = f"\n\n🛍️ Украденные вещи:\n{stolen_lines}"
+
     final_text = MSG_GAME_END.format(
         pobediteli=pobediteli,
         roles=roles_text,
         others=others_text
-    )
+    ) + stolen_block
+
     await send_gif(CHAT_ID, "game_end", final_text)
     game.phase = "ended"
     logger.info("Game finished")
@@ -698,6 +761,7 @@ async def kick_player(user_id: int):
     winner = game.check_win_condition()
     if winner and game.phase != "ended":
         game.winner = winner
+        game.end_reason = "win" if winner == "klepto" else "vote"
         await finish_game()
 
 @router.message(Command("kick"))
